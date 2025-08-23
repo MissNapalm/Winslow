@@ -43,25 +43,18 @@ class VoiceClaudeSystem:
             print("⚠️  Warning: Claude API key should start with 'sk-ant-api03-'")
         
         self.client = anthropic.Anthropic(api_key=claude_api_key)
+        self.google_client = texttospeech.TextToSpeechClient()
         
-        # Initialize TTS - try local first, fallback to Google
-        self.tts_engine = None
-        self.use_local_tts = self._init_local_tts()
+        # Google TTS voice configuration
+        self.voice = texttospeech.VoiceSelectionParams(
+            language_code="en-GB",
+            name="en-GB-Chirp3-HD-Enceladus",
+            ssml_gender=texttospeech.SsmlVoiceGender.MALE
+        )
         
-        if not self.use_local_tts:
-            print("🌐 Using Google Cloud TTS")
-            self.google_client = texttospeech.TextToSpeechClient()
-            
-            # Google TTS voice configuration
-            self.voice = texttospeech.VoiceSelectionParams(
-                language_code="en-GB",
-                name="en-GB-Chirp3-HD-Enceladus",
-                ssml_gender=texttospeech.SsmlVoiceGender.MALE
-            )
-            
-            self.audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
-            )
+        self.audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
         
         # Audio recording settings (optimized for speed)
         self.audio_format = pyaudio.paInt16
@@ -71,10 +64,9 @@ class VoiceClaudeSystem:
         self.recording = False
         self.audio_frames = []
         
-        # Persistent conversation memory (optimized)
+        # Persistent conversation memory
         self.memory_file = "conversation_memory.json"
         self.conversation_history = self._load_conversation_memory()
-        self.max_history = 10  # Keep only recent messages for faster processing
 
     def clean_response(self, response):
         """Remove unwanted therapeutic phrases and asterisk actions from AI responses"""
@@ -163,8 +155,10 @@ class VoiceClaudeSystem:
     def save_audio_to_temp_file(self):
         """Save recorded audio to a temporary WAV file"""
         if not self.audio_frames:
+            print("❌ No audio frames recorded")
             return None
         
+        print(f"💾 Saving {len(self.audio_frames)} audio frames...")
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         
         try:
@@ -176,32 +170,83 @@ class VoiceClaudeSystem:
             wf.writeframes(b''.join(self.audio_frames))
             wf.close()
             audio.terminate()
+            
+            file_size = os.path.getsize(temp_file.name)
+            print(f"✅ Audio saved to {temp_file.name} ({file_size} bytes)")
+            
+            if file_size == 0:
+                print("⚠️  Warning: Audio file is empty!")
+            
             return temp_file.name
         except Exception as e:
-            print(f"❌ Audio save failed: {e}")
+            print(f"❌ Error saving audio file: {e}")
             return None
     
     def transcribe_audio(self, audio_file_path):
-        """Transcribe audio using OpenAI Whisper API"""
+        """Transcribe audio using local Whisper, fallback to OpenAI API if needed"""
         try:
-            openai_api_key = os.getenv('OPENAI_API_KEY')
-            if not openai_api_key:
-                print("❌ OPENAI_API_KEY not found")
-                return None
+            print(f"🔍 Audio file size: {os.path.getsize(audio_file_path)} bytes")
             
-            from openai import OpenAI
-            openai_client = OpenAI(api_key=openai_api_key)
+            # Try local Whisper first
+            try:
+                import whisper
+                import ssl
+                
+                # Handle SSL certificate issues
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                # Load model once and cache it
+                if not hasattr(self, '_whisper_model'):
+                    whisper_model = os.getenv('WHISPER_MODEL', 'base')
+                    print(f"🧠 Loading Whisper model: {whisper_model}")
+                    # Temporarily disable SSL verification for model download
+                    import urllib.request
+                    old_context = urllib.request.urlopen.__defaults__
+                    urllib.request.urlopen.__defaults__ = (None, None, None, ssl_context)
+                    
+                    try:
+                        self._whisper_model = whisper.load_model(whisper_model)
+                        print(f"✅ Whisper model loaded locally")
+                    finally:
+                        # Restore original context
+                        urllib.request.urlopen.__defaults__ = old_context
+                
+                print("🎯 Transcribing locally...")
+                result = self._whisper_model.transcribe(audio_file_path, language='en')
+                print("✅ Local transcription completed")
+                return result["text"].strip()
+                
+            except Exception as local_error:
+                print(f"⚠️  Local Whisper failed: {local_error}")
+                print("🔄 Falling back to OpenAI API...")
+                
+                # Fallback to OpenAI API
+                openai_api_key = os.getenv('OPENAI_API_KEY')
+                if not openai_api_key:
+                    print("❌ No OpenAI API key for fallback")
+                    return None
+                
+                from openai import OpenAI
+                openai_client = OpenAI(api_key=openai_api_key)
+                
+                with open(audio_file_path, "rb") as audio_file:
+                    print("📡 Using OpenAI Whisper API...")
+                    transcript = openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        language="en"
+                    )
+                print("✅ API transcription completed")
+                return transcript.text.strip()
             
-            with open(audio_file_path, "rb") as audio_file:
-                transcript = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="en"
-                )
-            return transcript.text.strip()
-            
+        except ImportError as e:
+            print(f"❌ Import error: {e}")
+            print("💡 Install packages: pip install openai-whisper openai")
+            return None
         except Exception as e:
-            print(f"❌ Transcription failed: {e}")
+            print(f"❌ Transcription error: {e}")
             return None
     
     def generate_claude_response(self, text, system_prompt=None):
@@ -227,11 +272,11 @@ class VoiceClaudeSystem:
             # Use system prompt if provided
             system_message = system_prompt or "You are a helpful AI assistant. Respond conversationally and concisely in 1-2 sentences."
             
-            # Create Claude message with speed optimizations
+            # Create Claude message
             response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",  # Much faster model
-                max_tokens=250,  # Reasonable limit to avoid cutoffs but keep responses focused
-                temperature=0.1,  # Lower temperature for faster, more predictable responses
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=300,  # Increased to avoid cutoffs
+                temperature=0.2,
                 system=system_message,
                 messages=messages
             )
@@ -255,32 +300,20 @@ class VoiceClaudeSystem:
             if content and content[0].islower():
                 content = content[0].upper() + content[1:]
             
-            # Update conversation history with limits for speed
+            # Update conversation history
             self.conversation_history.append({"role": "user", "content": text})
             self.conversation_history.append({"role": "assistant", "content": content})
             
-            # Keep conversation history manageable for faster processing
-            if len(self.conversation_history) > self.max_history * 2:  # *2 because user+assistant pairs
-                self.conversation_history = self.conversation_history[-(self.max_history * 2):]
+            # Keep conversation history manageable (last 20 messages)
+            if len(self.conversation_history) > 20:
+                self.conversation_history = self.conversation_history[-20:]
             
-            # Save asynchronously to not block response
-            import threading
-            threading.Thread(target=self._save_conversation_memory, daemon=True).start()
-            
+            self._save_conversation_memory()
             return content
             
         except Exception as e:
             print(f"❌ Claude response error: {e}")
             return None
-
-    def stop_speaking(self):
-        """Stop any ongoing speech playback."""
-        try:
-            if self.use_local_tts and self.tts_engine:
-                self.tts_engine.stop()
-            pygame.mixer.music.stop()
-        except Exception:
-            pass
 
     def generate_speech_google(self, text):
         """Generate speech using Google Text-to-Speech API"""
@@ -330,68 +363,10 @@ class VoiceClaudeSystem:
             print(f"❌ Audio playback error: {e}")
             return False
     
-    def _init_local_tts(self):
-        """Initialize local TTS engine if available"""
-        try:
-            import pyttsx3
-            self.tts_engine = pyttsx3.init()
-            
-            # Configure voice settings
-            voices = self.tts_engine.getProperty('voices')
-            
-            # Try to find a male British voice, fallback to any male voice
-            preferred_voice = None
-            for voice in voices:
-                voice_name = voice.name.lower()
-                voice_id = voice.id.lower()
-                
-                # Look for British male voices
-                if ('british' in voice_name or 'uk' in voice_name or 'daniel' in voice_name) and 'male' in voice_name:
-                    preferred_voice = voice.id
-                    break
-                # Fallback to any male voice
-                elif 'male' in voice_name or 'david' in voice_name or 'alex' in voice_name:
-                    preferred_voice = voice.id
-            
-            if preferred_voice:
-                self.tts_engine.setProperty('voice', preferred_voice)
-                print(f"🗣️  Using local TTS voice: {preferred_voice}")
-            
-            # Set speech rate and volume for speed
-            self.tts_engine.setProperty('rate', 200)  # Faster speech rate
-            self.tts_engine.setProperty('volume', 0.95)
-            
-            print("⚡ Local TTS initialized successfully (SPEED MODE!)")
-            return True
-            
-        except ImportError:
-            print("📦 pyttsx3 not installed, using Google TTS")
-            print("💡 For faster TTS: pip install pyttsx3")
-            return False
-        except Exception as e:
-            print(f"⚠️  Local TTS init failed: {e}, using Google TTS")
-            return False
-
     def speak_text(self, text):
-        """Generate and play speech using local TTS"""
-        if self.use_local_tts:
-            try:
-                import threading
-                def speak_async():
-                    self.tts_engine.say(text)
-                    self.tts_engine.runAndWait()
-                
-                speak_thread = threading.Thread(target=speak_async, daemon=True)
-                speak_thread.start()
-                return
-            except Exception as e:
-                print(f"❌ TTS failed: {e}")
+        """Generate and play speech using Google TTS"""
+        print(f"🔊 Speaking: {text}")
         
-        # Fallback to Google TTS
-        self._speak_with_google_tts(text)
-    
-    def _speak_with_google_tts(self, text):
-        """Generate and play speech using Google TTS (original method)"""
         # Generate speech
         audio_bytes = self.generate_speech_google(text)
         
@@ -399,14 +374,14 @@ class VoiceClaudeSystem:
             # Play the audio
             success = self.play_audio_from_bytes(audio_bytes)
             if success:
-                print("✅ Google TTS speech playback completed.")
+                print("✅ Speech playback completed.")
             else:
                 print("❌ Failed to play speech audio.")
         else:
             print("❌ Failed to generate speech.")
     
     def process_voice_input(self, system_prompt=None):
-        """Complete workflow: record -> transcribe -> generate response -> speak"""
+        """Complete workflow: record -> transcribe -> generate response -> speak, with memory."""
         # Start recording in a separate thread
         record_thread = threading.Thread(target=self.record_audio)
         record_thread.start()
@@ -414,39 +389,31 @@ class VoiceClaudeSystem:
         input()
         self.stop_recording()
         record_thread.join()
-        
         # Save audio to temporary file
         audio_file = self.save_audio_to_temp_file()
         if not audio_file:
-            print("❌ No audio recorded")
+            print("❌ No audio recorded.")
             return None, None
-        
         try:
-            # Transcribe
+            print("🔄 Transcribing audio...")
             transcription = self.transcribe_audio(audio_file)
-            if not transcription:
-                print("❌ Transcription failed")
-                return None, None
-                
-            print(f"You: {transcription}")
-            
-            # Generate response
-            response = self.generate_claude_response(transcription, system_prompt)
-            if not response:
-                print("❌ Response generation failed")
-                return None, None
-                
-            print(f"Claude: {response}")
-            
-            # Speak response
-            self.speak_text(response)
-            return transcription, response
-            
+            if transcription:
+                print(f"📝 You said: {transcription}")
+                print("🤖 Generating Claude response...")
+                response = self.generate_claude_response(transcription, system_prompt)
+                if response:
+                    print(f"💬 Claude replied: {response}")
+                    print("🎵 Generating speech...")
+                    self.speak_text(response)
+                    return transcription, response
+                else:
+                    print("❌ Failed to generate response.")
+            else:
+                print("❌ Failed to transcribe audio.")
         finally:
             # Clean up temporary file
             if os.path.exists(audio_file):
                 os.unlink(audio_file)
-        
         return None, None
 
 def main():
@@ -487,8 +454,15 @@ def main():
             
             transcription, response = voice_claude.process_voice_input(system_prompt)
             
-            print("🔄 Ready for next exchange...\n")
-            time.sleep(0.5)  # Brief pause before next round
+            if transcription and response:
+                print("\n" + "="*60)
+                print("📋 CONVERSATION SUMMARY:")
+                print(f"🗣️  You: {transcription}")
+                print(f"🤖 Claude: {response}")
+                print("="*60)
+            
+            print("\n🔄 Ready for next exchange...")
+            time.sleep(1)  # Brief pause before next round
             
     except KeyboardInterrupt:
         print("\n\n👋 Goodbye! Thanks for chatting!")
