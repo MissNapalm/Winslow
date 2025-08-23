@@ -5,11 +5,11 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import threading
 import time
-import requests
 import pygame
 from io import BytesIO
 import pyaudio
 import wave
+from google.cloud import texttospeech
 
 # Load environment variables
 load_dotenv()
@@ -24,12 +24,22 @@ class VoiceGPTSystem:
             pygame.mixer.music.stop()
         except Exception:
             pass
+
     def __init__(self):
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        self.elevenlabs_api_key = os.getenv('ELEVENLABS_API_KEY')
-        self.elevenlabs_voice_id = "HLXBCncM2sIxwTmiIZg8"  # Voice
-        if not self.elevenlabs_api_key:
-            raise ValueError("ELEVENLABS_API_KEY not found in environment variables!")
+        self.google_client = texttospeech.TextToSpeechClient()
+        
+        # Google TTS voice configuration
+        self.voice = texttospeech.VoiceSelectionParams(
+            language_code="en-GB",
+            name="en-GB-Chirp3-HD-Enceladus",
+            ssml_gender=texttospeech.SsmlVoiceGender.MALE
+        )
+        
+        self.audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        
         # Audio recording settings
         self.audio_format = pyaudio.paInt16
         self.channels = 1
@@ -37,6 +47,7 @@ class VoiceGPTSystem:
         self.chunk = 1024
         self.recording = False
         self.audio_frames = []
+        
         # Persistent conversation memory
         self.memory_file = "conversation_memory.json"
         self.conversation_history = self._load_conversation_memory()
@@ -174,35 +185,20 @@ class VoiceGPTSystem:
             print(f"❌ GPT response error: {e}")
             return None
 
-    def generate_speech_elevenlabs(self, text, voice_id=None):
-        """Generate speech using ElevenLabs API"""
-        if not voice_id:
-            voice_id = self.elevenlabs_voice_id
-            
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-        
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": self.elevenlabs_api_key
-        }
-        
-        data = {
-            "text": text,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {
-                "stability": 1,
-                "similarity_boost": 1
-            }
-        }
-        
+    def generate_speech_google(self, text):
+        """Generate speech using Google Text-to-Speech API"""
         try:
-            response = requests.post(url, json=data, headers=headers)
-            response.raise_for_status()
+            synthesis_input = texttospeech.SynthesisInput(text=text)
             
-            return response.content
-        except requests.exceptions.RequestException as e:
-            print(f"❌ ElevenLabs API error: {e}")
+            response = self.google_client.synthesize_speech(
+                input=synthesis_input,
+                voice=self.voice,
+                audio_config=self.audio_config
+            )
+            
+            return response.audio_content
+        except Exception as e:
+            print(f"❌ Google TTS error: {e}")
             return None
     
     def play_audio_from_bytes(self, audio_bytes):
@@ -238,11 +234,11 @@ class VoiceGPTSystem:
             return False
     
     def speak_text(self, text):
-        """Generate and play speech using ElevenLabs"""
+        """Generate and play speech using Google TTS"""
         print(f"🔊 Speaking: {text}")
         
         # Generate speech
-        audio_bytes = self.generate_speech_elevenlabs(text)
+        audio_bytes = self.generate_speech_google(text)
         
         if audio_bytes:
             # Play the audio
@@ -291,20 +287,16 @@ class VoiceGPTSystem:
         return None, None
 
 def main():
-    print("🎤 Voice-to-GPT System with ElevenLabs TTS")
+    print("🎤 Voice-to-GPT System with Google TTS")
     print("=" * 50)
     
     # Initialize the system
     try:
         voice_gpt = VoiceGPTSystem()
         print("✅ System initialized successfully!")
-    except ValueError as e:
-        print(f"❌ Error: {e}")
-        print("Please make sure you have ELEVENLABS_API_KEY in your .env file")
-        return
     except Exception as e:
         print(f"❌ Initialization error: {e}")
-        print("Make sure you have installed: pip3 install pyaudio openai python-dotenv requests pygame")
+        print("Make sure you have Google Cloud credentials set up and installed: pip3 install pyaudio openai python-dotenv pygame google-cloud-texttospeech")
         return
     
     # Load system prompt from file or use default
