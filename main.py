@@ -10,6 +10,7 @@ from io import BytesIO
 import pyaudio
 import wave
 from google.cloud import texttospeech
+from openai import OpenAI
 import re
 
 # Load environment variables
@@ -32,17 +33,21 @@ class VoiceClaudeSystem:
         if not claude_api_key:
             raise ValueError("CLAUDE_API_KEY not found in environment variables")
         
-        # Remove any whitespace/newlines that might have been copied
         claude_api_key = claude_api_key.strip()
-        
         print(f"🔑 Claude API key format: {claude_api_key[:15]}...")
-        print(f"🔑 Key length: {len(claude_api_key)} characters")
         
-        # Validate key format
         if not claude_api_key.startswith('sk-ant-api03-'):
             print("⚠️  Warning: Claude API key should start with 'sk-ant-api03-'")
         
         self.client = anthropic.Anthropic(api_key=claude_api_key)
+        
+        # Initialize OpenAI client for transcription
+        openai_api_key = os.getenv('OPENAI_API_KEY')
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        self.openai_client = OpenAI(api_key=openai_api_key)
+        
+        # Initialize Google TTS
         self.google_client = texttospeech.TextToSpeechClient()
         
         # Google TTS voice configuration
@@ -172,7 +177,7 @@ class VoiceClaudeSystem:
             audio.terminate()
             
             file_size = os.path.getsize(temp_file.name)
-            print(f"✅ Audio saved to {temp_file.name} ({file_size} bytes)")
+            print(f"✅ Audio saved ({file_size} bytes)")
             
             if file_size == 0:
                 print("⚠️  Warning: Audio file is empty!")
@@ -183,68 +188,18 @@ class VoiceClaudeSystem:
             return None
     
     def transcribe_audio(self, audio_file_path):
-        """Transcribe audio using local Whisper, fallback to OpenAI API if needed"""
+        """Transcribe audio using OpenAI Whisper API directly"""
         try:
-            print(f"🔍 Audio file size: {os.path.getsize(audio_file_path)} bytes")
+            with open(audio_file_path, "rb") as audio_file:
+                print("🔄 Transcribing with OpenAI Whisper...")
+                transcript = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="en"
+                )
+            print("✅ Transcription completed")
+            return transcript.text.strip()
             
-            # Try local Whisper first
-            try:
-                import whisper
-                import ssl
-                
-                # Handle SSL certificate issues
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-                # Load model once and cache it
-                if not hasattr(self, '_whisper_model'):
-                    whisper_model = os.getenv('WHISPER_MODEL', 'base')
-                    print(f"🧠 Loading Whisper model: {whisper_model}")
-                    # Temporarily disable SSL verification for model download
-                    import urllib.request
-                    old_context = urllib.request.urlopen.__defaults__
-                    urllib.request.urlopen.__defaults__ = (None, None, None, ssl_context)
-                    
-                    try:
-                        self._whisper_model = whisper.load_model(whisper_model)
-                        print(f"✅ Whisper model loaded locally")
-                    finally:
-                        # Restore original context
-                        urllib.request.urlopen.__defaults__ = old_context
-                
-                print("🎯 Transcribing locally...")
-                result = self._whisper_model.transcribe(audio_file_path, language='en')
-                print("✅ Local transcription completed")
-                return result["text"].strip()
-                
-            except Exception as local_error:
-                print(f"⚠️  Local Whisper failed: {local_error}")
-                print("🔄 Falling back to OpenAI API...")
-                
-                # Fallback to OpenAI API
-                openai_api_key = os.getenv('OPENAI_API_KEY')
-                if not openai_api_key:
-                    print("❌ No OpenAI API key for fallback")
-                    return None
-                
-                from openai import OpenAI
-                openai_client = OpenAI(api_key=openai_api_key)
-                
-                with open(audio_file_path, "rb") as audio_file:
-                    print("📡 Using OpenAI Whisper API...")
-                    transcript = openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language="en"
-                    )
-                print("✅ API transcription completed")
-                return transcript.text.strip()
-            
-        except ImportError as e:
-            print(f"❌ Import error: {e}")
-            print("💡 Install packages: pip install openai-whisper openai")
-            return None
         except Exception as e:
             print(f"❌ Transcription error: {e}")
             return None
@@ -395,7 +350,6 @@ class VoiceClaudeSystem:
             print("❌ No audio recorded.")
             return None, None
         try:
-            print("🔄 Transcribing audio...")
             transcription = self.transcribe_audio(audio_file)
             if transcription:
                 print(f"📝 You said: {transcription}")
@@ -417,7 +371,7 @@ class VoiceClaudeSystem:
         return None, None
 
 def main():
-    print("🎤 Voice-to-Claude System with Google TTS (en-GB-Chirp3-HD-Enceladus)")
+    print("🎤 Voice-to-Claude System with Google TTS (Optimized)")
     print("=" * 50)
     
     # Initialize the system
@@ -428,9 +382,9 @@ def main():
         print(f"❌ Initialization error: {e}")
         print("Make sure you have:")
         print("- CLAUDE_API_KEY in your .env file")
-        print("- OPENAI_API_KEY in your .env file (for Whisper transcription)")
+        print("- OPENAI_API_KEY in your .env file")
         print("- Google Cloud credentials set up")
-        print("- Required packages: pip3 install anthropic pyaudio python-dotenv pygame google-cloud-texttospeech")
+        print("- Required packages: pip3 install anthropic pyaudio python-dotenv pygame google-cloud-texttospeech openai")
         return
     
     # Load system prompt from file or use default
