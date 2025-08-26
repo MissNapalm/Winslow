@@ -1,24 +1,45 @@
 import os
+import sys
 import threading
 import pyaudio
-import wave
 import anthropic
 from dotenv import load_dotenv
-from google.cloud import texttospeech
-import pygame
 from io import BytesIO
 import numpy as np
 from faster_whisper import WhisperModel
-import pyttsx3
 import time
 import concurrent.futures
 import warnings
+import subprocess
+import platform
+import shutil
+import json
+import re
 
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Load environment variables
 load_dotenv()
+
+# ---------- Typewriter printer (yellow) ----------
+def typewriter_print(text, delay=0.01, color="\033[93m"):
+    """Print text with a typewriter effect in yellow by default (ANSI)."""
+    try:
+        sys.stdout.write(color)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(delay)
+    # reset color + newline
+    try:
+        sys.stdout.write("\033[0m\n")
+    except Exception:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 class UltraFastTranscriber:
     def __init__(self):
@@ -33,53 +54,130 @@ class UltraFastTranscriber:
         try:
             self.whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
             print("✅ Using GPU acceleration")
-        except:
+        except Exception:
             self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
             print("✅ Using CPU (install CUDA for GPU speedup)")
         
-        # Initialize local TTS
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 200)  # Fast speaking rate
-        voices = self.tts_engine.getProperty('voices')
-        # Try to find a male British voice
-        for voice in voices:
-            if 'male' in voice.name.lower() or 'daniel' in voice.name.lower():
-                self.tts_engine.setProperty('voice', voice.id)
-                break
+        # Initialize TTS
+        self.setup_tts()
         
-        # Initialize Google TTS as backup
-        pygame.mixer.init()
-        try:
-            self.google_client = texttospeech.TextToSpeechClient()
-            self.voice = texttospeech.VoiceSelectionParams(
-                language_code="en-GB",
-                name="en-GB-Chirp3-HD-Enceladus",
-                ssml_gender=texttospeech.SsmlVoiceGender.MALE
-            )
-            self.audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
-            )
-            self.google_tts_available = True
-        except:
-            self.google_tts_available = False
-            print("⚠️  Google TTS not available, using local TTS only")
-        
-        # Load prompt from file
-        self.system_prompt = self.load_prompt_from_file()
+        # Load base system prompt from file
+        self.base_system_prompt = self.load_prompt_from_file()
+
+        # Conversation memory (persisted)
+        self.history = []             # list of {"role": "user"|"assistant", "content": str}
+        self.running_summary = ""     # rolling summary of older context
+        self.max_history_chars = 14000
+        self.memory_path = "conversation.json"
+        self._load_memory()
         
         # Optimized audio settings
         self.audio_format = pyaudio.paInt16
         self.channels = 1
-        self.rate = 16000  # Optimal for Whisper
-        self.chunk = 8192  # Larger chunks for speed
+        self.rate = 16000
+        self.chunk = 8192
         self.recording = False
         self.audio_data = BytesIO()
         
-        # Threading executor for parallel processing
+        # Threading executor
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
+        # Keyboard raw mode support (for spacebar)
+        self._raw_supported = self._detect_raw_mode_support()
+
+    # ---------- Memory management ----------
+    def _load_memory(self):
+        try:
+            if os.path.exists(self.memory_path):
+                with open(self.memory_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.history = data.get("history", [])
+                self.running_summary = data.get("running_summary", "")
+                print("🧠 Loaded conversation memory.")
+        except Exception as e:
+            print(f"⚠️ Could not load memory: {e}")
+
+    def _save_memory(self):
+        try:
+            with open(self.memory_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"history": self.history, "running_summary": self.running_summary},
+                    f, ensure_ascii=False, indent=2
+                )
+        except Exception as e:
+            print(f"⚠️ Could not save memory: {e}")
+
+    def _maybe_summarize_history(self):
+        """When history gets big, summarize the oldest half into running_summary."""
+        try:
+            serialized = json.dumps(self.history, ensure_ascii=False)
+            if len(serialized) <= self.max_history_chars or len(self.history) < 6:
+                return
+
+            cut = max(3, len(self.history) // 2)
+            old_chunk = self.history[:cut]
+            self.history = self.history[cut:]
+
+            prompt = (
+                "Summarize the prior conversation turns below into 8–12 concise bullet points. "
+                "Capture user preferences, facts about the user, ongoing tasks, decisions, and unresolved threads. "
+                "Keep it neutral and compact.\n\n" + json.dumps(old_chunk, ensure_ascii=False)
+            )
+            resp = self.claude_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=300,
+                temperature=0.2,
+                system="You are a precise summarizer.",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            summary = resp.content[0].text.strip()
+            self.running_summary += (("\n" if self.running_summary else "") + summary)
+            print("🧠 Summarized older history.")
+        except Exception as e:
+            print(f"⚠️ Could not summarize: {e}")
+
+    def _reset_memory(self):
+        self.history = []
+        self.running_summary = ""
+        self._save_memory()
+        print("🧼 Memory reset.")
+
+    # ---------- TTS ----------
+    def setup_tts(self):
+        self.tts_available = False
+        if platform.system() == 'Darwin':
+            if shutil.which('say'):
+                self.tts_available = True
+                print("✅ macOS system TTS available")
+        elif platform.system() == 'Linux':
+            if shutil.which('espeak'):
+                self.tts_available = True
+                print("✅ Linux espeak TTS available")
+
+    def speak_system(self, text):
+        if not self.tts_available:
+            # Still return True to avoid blocking workflows that wait for TTS
+            print(f"🔊 Character would say: {text}")
+            return True
+        try:
+            if platform.system() == 'Darwin':
+                subprocess.run(['say', '-v', 'Jamie (Premium)', '-r', '180', text], check=True)
+            elif platform.system() == 'Linux':
+                subprocess.run(['espeak', '-s', '160', '-p', '40', text], check=True)
+            return True
+        except Exception as e:
+            print(f"❌ System TTS error: {e}")
+            print(f"🔊 Character would say: {text}")
+            return False
+
+    def speak_async(self, text):
+        """Start OS TTS in the background so it overlaps with the typewriter."""
+        t = threading.Thread(target=self.speak_system, args=(text,), daemon=True)
+        t.start()
+        return t
+
+    # ---------- Prompt ----------
     def load_prompt_from_file(self, prompt_file_path="prompt.txt"):
-        """Load system prompt from a text file"""
         try:
             if os.path.exists(prompt_file_path):
                 with open(prompt_file_path, 'r', encoding='utf-8') as file:
@@ -87,16 +185,44 @@ class UltraFastTranscriber:
                     if prompt:
                         print(f"✅ Loaded character prompt from {prompt_file_path}")
                         return prompt
-            print(f"⚠️  Using default prompt")
             return "You are a helpful AI assistant. Keep responses concise and conversational."
         except Exception as e:
             print(f"❌ Error reading prompt file: {e}")
             return "You are a helpful AI assistant. Keep responses concise and conversational."
 
+    # ---------- Audio + Spacebar interrupt ----------
+    def _detect_raw_mode_support(self):
+        if platform.system() == "Windows":
+            return True  # we'll use msvcrt
+        # POSIX: require a TTY
+        return sys.stdin.isatty()
+
+    # POSIX raw mode helpers
+    def _posix_raw_reader(self, stop_flag):
+        """Read single chars in raw mode on a background thread; stop on SPACE/ENTER."""
+        import termios, tty, select
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)  # cbreak so we get chars immediately
+            while self.recording and not stop_flag.is_set():
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if rlist:
+                    ch = sys.stdin.read(1)
+                    if ch in (' ', '\n', '\r'):
+                        self.stop_recording()
+                        stop_flag.set()
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
     def record_audio_optimized(self):
-        """Record audio directly to memory with optimized settings"""
         audio = pyaudio.PyAudio()
-        
         stream = audio.open(
             format=self.audio_format,
             channels=self.channels,
@@ -104,192 +230,245 @@ class UltraFastTranscriber:
             input=True,
             frames_per_buffer=self.chunk
         )
-        
-        print("🎤 Recording... Press Enter to stop.")
+
+        # UX hint
+        if self._raw_mode_is_windows():
+            print("🎤 Recording... Press SPACE (or Enter) to stop.")
+        elif self._raw_supported:
+            print("🎤 Recording... Press SPACE (or Enter) to stop.")
+        else:
+            print("🎤 Recording... Press Enter to stop (raw keys unavailable).")
+
         self.recording = True
         audio_frames = []
-        
-        while self.recording:
-            try:
-                data = stream.read(self.chunk, exception_on_overflow=False)
-                audio_frames.append(data)
-            except:
-                continue
-        
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
-        
+
+        # Start a raw key listener where possible
+        stop_flag = threading.Event()
+        key_thread = None
+
+        if self._raw_mode_is_windows():
+            import msvcrt
+        elif self._raw_supported:
+            key_thread = threading.Thread(target=self._posix_raw_reader, args=(stop_flag,), daemon=True)
+            key_thread.start()
+        else:
+            def _enter_waiter():
+                try:
+                    input()
+                except Exception:
+                    pass
+                self.stop_recording()
+                stop_flag.set()
+            key_thread = threading.Thread(target=_enter_waiter, daemon=True)
+            key_thread.start()
+
+        try:
+            while self.recording:
+                if self._raw_mode_is_windows():
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        try:
+                            ch = msvcrt.getch()
+                            if ch in (b' ', b'\r', b'\n'):
+                                self.stop_recording()
+                                break
+                        except Exception:
+                            pass
+
+                try:
+                    data = stream.read(self.chunk, exception_on_overflow=False)
+                    audio_frames.append(data)
+                except Exception:
+                    continue
+        finally:
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
+            # ensure key thread cleaned up
+            stop_flag.set()
+            if key_thread and key_thread.is_alive():
+                try:
+                    key_thread.join(timeout=0.1)
+                except Exception:
+                    pass
+
         return b''.join(audio_frames)
-        
+
+    def _raw_mode_is_windows(self):
+        return platform.system() == "Windows"
+
     def stop_recording(self):
-        """Stop the current recording"""
         self.recording = False
     
     def transcribe_audio_local(self, audio_data):
-        """Transcribe audio using local faster-whisper"""
         try:
-            # Convert raw audio to numpy array
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            
-            # Transcribe with faster-whisper
             segments, info = self.whisper_model.transcribe(
                 audio_np,
                 language="en",
-                beam_size=1,  # Faster beam search
-                best_of=1,    # Don't search multiple candidates
-                temperature=0.0  # Deterministic output
+                beam_size=1,
+                best_of=1,
+                temperature=0.0
             )
-            
-            # Extract text from segments
             text = " ".join([segment.text.strip() for segment in segments])
             return text
-            
         except Exception as e:
             print(f"❌ Local transcription error: {e}")
             return None
-    
-    def clean_response(self, response):
-        """Remove asterisk actions and text between asterisks"""
-        import re
-        # Remove everything between asterisks including the asterisks
-        cleaned = re.sub(r'\*[^*]*\*', '', response)
-        # Clean up extra whitespace
-        cleaned = ' '.join(cleaned.split())
-        return cleaned.strip()
 
-    def get_claude_response(self, text):
-        """Get response from Claude API using the character prompt"""
-        try:
-            response = self.claude_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=150,  # Shorter for speed
-                temperature=0.7,
-                system=self.system_prompt,
-                messages=[{"role": "user", "content": text}]
+    # ---------- Helpers ----------
+    def clean_response(self, response: str) -> str:
+        # Remove action asterisks like *smiles*
+        cleaned = re.sub(r'\*[^*]*\*', '', response or '')
+        return ' '.join(cleaned.split()).strip()
+
+    def _build_system_prompt(self) -> str:
+        """Combine base system prompt + running memory into a single top-level system string."""
+        if self.running_summary:
+            return (
+                f"{self.base_system_prompt}\n\n"
+                f"--- Memory (summarized context) ---\n"
+                f"{self.running_summary}\n"
+                f"--- End Memory ---"
             )
-            raw_response = response.content[0].text.strip()
-            # Clean the response by removing asterisk actions
-            cleaned_response = self.clean_response(raw_response)
-            return cleaned_response
-        except Exception as e:
-            print(f"❌ Claude error: {e}")
-            return None
+        return self.base_system_prompt
 
-    def speak_local_fast(self, text):
-        """Speak using Google TTS (local TTS has issues on macOS)"""
-        if not self.google_tts_available:
+    def _maybe_handle_voice_command(self, text: str) -> bool:
+        """Return True if a local command was handled (e.g., reset memory)."""
+        if not text:
             return False
-        
-        try:
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            response = self.google_client.synthesize_speech(
-                input=synthesis_input,
-                voice=self.voice,
-                audio_config=self.audio_config
-            )
-            
-            audio_file = BytesIO(response.audio_content)
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
-            
-            while pygame.mixer.music.get_busy():
-                pygame.time.wait(50)
+        t = text.strip().lower()
+        if any(cmd in t for cmd in ["reset memory", "clear memory", "forget everything", "wipe memory"]):
+            self._reset_memory()
+            print("🗑️  Memory cleared by voice command.")
             return True
-        except Exception as e:
-            print(f"❌ TTS error: {e}")
-            return False
+        return False
 
-    def speak_google_backup(self, text):
-        """This is now the same as speak_local_fast"""
-        return self.speak_local_fast(text)
+    # ---------- Claude ----------
+    def get_claude_response(self, text):
+        # Optional local command (e.g., "reset memory")
+        if self._maybe_handle_voice_command(text):
+            return "Okay — I’ve cleared our memory."
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"🤖 Getting Claude response (attempt {attempt + 1}/{max_retries})...")
+
+                # Append new user turn and maybe summarize
+                self.history.append({"role": "user", "content": text})
+                self._maybe_summarize_history()
+
+                # Build messages: ONLY user/assistant roles
+                conv = [
+                    m for m in self.history[-20:]
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                ]
+
+                # Top-level system carries base prompt + running memory
+                system_str = self._build_system_prompt()
+
+                response = self.claude_client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=200,
+                    temperature=0.7,
+                    system=system_str,   # ✅ top-level system
+                    messages=conv        # ✅ only 'user'|'assistant'
+                )
+                raw = response.content[0].text.strip()
+                cleaned = self.clean_response(raw)
+
+                # Save assistant reply and persist
+                self.history.append({"role": "assistant", "content": cleaned})
+                self._save_memory()
+
+                return cleaned
+            except Exception as e:
+                print(f"❌ Claude error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+        return "Sorry, I'm having trouble connecting right now. Can you try again?"
 
     def parallel_process(self, transcription):
-        """Process Claude response and TTS in parallel"""
-        # Start Claude response
-        claude_future = self.executor.submit(self.get_claude_response, transcription)
-        
-        # Wait for Claude response
-        response = claude_future.result(timeout=10)
-        
-        if response:
-            print(f"🤖 Character: {response}")
-            
-            # Try Google TTS (reliable audio output)
-            print("🔊 Speaking...")
-            if not self.speak_local_fast(response):
-                print("❌ Speech failed")
-            else:
-                print("✅ Speech completed")
-        
-        return response
+        """Get reply, start TTS + typewriter together, and WAIT until TTS finishes before returning."""
+        try:
+            reply = self.executor.submit(self.get_claude_response, transcription).result(timeout=45)
+            if reply:
+                # Start TTS immediately (non-blocking) so it overlaps with typewriter
+                tts_thread = self.speak_async(reply)
+                # Yellow typewriter prints in parallel with TTS
+                typewriter_print(f"🤖 Character: {reply}")
+                # 🔒 IMPORTANT: wait for TTS to finish before starting next cycle
+                if tts_thread is not None:
+                    tts_thread.join()
+            return reply
+        except concurrent.futures.TimeoutError:
+            fallback = "Sorry, I'm taking too long to think. Can you try again?"
+            tts_thread = self.speak_async(fallback)
+            typewriter_print(f"🤖 Character: {fallback}")
+            if tts_thread is not None:
+                tts_thread.join()
+            return fallback
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+            return None
 
+    # ---------- Workflow ----------
     def ultra_fast_workflow(self):
-        """Ultra-optimized workflow with parallel processing"""
-        start_time = time.time()
-        
-        # Start recording in separate thread
-        record_thread = threading.Thread(target=lambda: setattr(self, 'audio_buffer', self.record_audio_optimized()))
-        record_thread.start()
-        
-        # Wait for user input
-        input()
-        self.stop_recording()
-        record_thread.join()
-        
-        if not hasattr(self, 'audio_buffer') or not self.audio_buffer:
+        # Start recording directly; stop via SPACE or Enter (raw), or Enter fallback
+        self.audio_buffer = self.record_audio_optimized()
+
+        if not self.audio_buffer:
             return None, None
-        
-        record_time = time.time()
-        print(f"⏱️  Recording: {record_time - start_time:.2f}s")
-        
-        # Fast local transcription
+
         transcription = self.transcribe_audio_local(self.audio_buffer)
-        
         if transcription:
-            transcribe_time = time.time()
             print(f"📝 You said: {transcription}")
-            print(f"⏱️  Transcription: {transcribe_time - record_time:.2f}s")
-            
-            # Parallel processing
+            # parallel_process waits for TTS to complete before returning
             response = self.parallel_process(transcription)
-            
-            total_time = time.time()
-            print(f"⏱️  Total time: {total_time - start_time:.2f}s")
-            
             return transcription, response
-        
         return None, None
 
 def main():
     print("⚡ ULTRA-FAST Voice Character System")
     print("=" * 40)
-    
     try:
         transcriber = UltraFastTranscriber()
         print("✅ Ultra-fast system ready!")
     except Exception as e:
         print(f"❌ Error: {e}")
-        print("Install missing packages:")
-        print("pip install faster-whisper pyttsx3 numpy")
         return
-    
-    print("\n🎯 Ready! Speak to your character...")
-    
+
+    if transcriber.tts_available:
+        print("🔊 System TTS enabled")
+    else:
+        print("⚠️  No TTS available - text output only")
+        if platform.system() == 'Linux':
+            print("   • sudo apt-get install espeak")
+        elif platform.system() not in ['Darwin', 'Linux']:
+            print("   • Use macOS or Linux for system TTS")
+
+    print("\n🎯 Ready! Speak — press SPACE (or Enter) to stop.")
     try:
         while True:
-            transcription, response = transcriber.ultra_fast_workflow()
-            if transcription and response:
-                print("=" * 60)
-            elif transcription:
-                print("❌ No response from Claude")
-            else:
-                print("❌ No transcription available")
-                
+            try:
+                transcription, response = transcriber.ultra_fast_workflow()
+                if transcription and response:
+                    print("=" * 60)
+            except KeyboardInterrupt:
+                print("\n👋 Goodbye!")
+                break
+            except Exception as e:
+                print(f"❌ Error in workflow: {e}")
+                continue
     except KeyboardInterrupt:
         print("\n👋 Goodbye!")
     finally:
-        transcriber.executor.shutdown()
+        try:
+            transcriber.executor.shutdown(wait=False)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
