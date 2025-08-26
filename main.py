@@ -154,20 +154,47 @@ class UltraFastTranscriber:
                 self.tts_available = True
                 print("✅ Linux espeak TTS available")
 
+    def clean_text_for_tts(self, text):
+        """Remove visual elements that don't speak well but keep the text readable."""
+        if not text:
+            return ""
+        
+        # Remove common emoticons and visual elements that TTS mangles
+        tts_text = text
+        
+        # Remove bracketed emoticons like >:], :], [smirk], etc.
+        tts_text = re.sub(r'>:\]', '', tts_text)
+        tts_text = re.sub(r':\]', '', tts_text) 
+        tts_text = re.sub(r'\[.*?\]', '', tts_text)
+        tts_text = re.sub(r'<.*?>', '', tts_text)
+        
+        # Remove other common visual markers
+        tts_text = re.sub(r'[>]{2,}', '', tts_text)  # Remove >> markers
+        tts_text = re.sub(r'[*]{1,2}[^*]*[*]{1,2}', '', tts_text)  # Remove *action* markers
+        
+        # Clean up extra whitespace
+        tts_text = ' '.join(tts_text.split()).strip()
+        
+        return tts_text
+
     def speak_system(self, text):
         if not self.tts_available:
             # Still return True to avoid blocking workflows that wait for TTS
             print(f"🔊 Character would say: {text}")
             return True
+        
+        # Clean text for TTS while keeping original for display
+        tts_text = self.clean_text_for_tts(text)
+        
         try:
             if platform.system() == 'Darwin':
-                subprocess.run(['say', '-v', 'Jamie (Premium)', '-r', '180', text], check=True)
+                subprocess.run(['say', '-v', 'Jamie (Premium)', '-r', '180', tts_text], check=True)
             elif platform.system() == 'Linux':
-                subprocess.run(['espeak', '-s', '160', '-p', '40', text], check=True)
+                subprocess.run(['espeak', '-s', '160', '-p', '40', tts_text], check=True)
             return True
         except Exception as e:
             print(f"❌ System TTS error: {e}")
-            print(f"🔊 Character would say: {text}")
+            print(f"🔊 Character would say: {tts_text}")
             return False
 
     def speak_async(self, text):
@@ -303,35 +330,138 @@ class UltraFastTranscriber:
     def transcribe_audio_local(self, audio_data):
         try:
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Add initial prompt to discourage transcribing punctuation as words
+            initial_prompt = "Hello, how are you today? I'm doing well, thanks for asking."
+            
             segments, info = self.whisper_model.transcribe(
                 audio_np,
                 language="en",
                 beam_size=1,
                 best_of=1,
-                temperature=0.0
+                temperature=0.0,
+                initial_prompt=initial_prompt
             )
             text = " ".join([segment.text.strip() for segment in segments])
+            
+            # Clean up common transcription artifacts
+            text = self.clean_transcription(text)
+            
             return text
         except Exception as e:
             print(f"❌ Local transcription error: {e}")
             return None
 
+    def clean_transcription(self, text: str) -> str:
+        """Clean transcription artifacts like spoken punctuation."""
+        if not text:
+            return ""
+        
+        cleaned = text.strip()
+        
+        # Remove common transcription artifacts where punctuation is transcribed as words
+        punctuation_words = [
+            (r'\bcomma\b', ','),
+            (r'\bperiod\b', '.'),  
+            (r'\bquestion mark\b', '?'),
+            (r'\bexclamation mark\b', '!'),
+            (r'\bexclamation point\b', '!'),
+            (r'\bcolon\b', ':'),
+            (r'\bsemicolon\b', ';'),
+            (r'\bdash\b', '-'),
+            (r'\bhyphen\b', '-'),
+            (r'\bquote\b', '"'),
+            (r'\bunquote\b', '"'),
+            (r'\bopen paren\b', '('),
+            (r'\bclose paren\b', ')'),
+            (r'\bopen parenthesis\b', '('),
+            (r'\bclose parenthesis\b', ')'),
+        ]
+        
+        # Apply replacements
+        for word_pattern, punctuation in punctuation_words:
+            cleaned = re.sub(word_pattern, punctuation, cleaned, flags=re.IGNORECASE)
+        
+        # Remove standalone punctuation words at the beginning
+        cleaned = re.sub(r'^(comma|period|question mark|exclamation|colon|semicolon)\s+', '', cleaned, flags=re.IGNORECASE)
+        
+        # Clean up extra spaces around punctuation
+        cleaned = re.sub(r'\s+([,.!?;:])', r'\1', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        return cleaned
+
     # ---------- Helpers ----------
     def clean_response(self, response: str) -> str:
+        """Enhanced cleaning to handle common speech artifacts and remove all emoticons."""
+        if not response:
+            return ""
+        
+        cleaned = response.strip()
+        
+        # Remove ALL emoticons and visual elements
+        # Remove bracketed emoticons like >:], :], [smirk], etc.
+        cleaned = re.sub(r'>:\]', '', cleaned)
+        cleaned = re.sub(r':\]', '', cleaned)
+        cleaned = re.sub(r':\)', '', cleaned)
+        cleaned = re.sub(r':\(', '', cleaned)
+        cleaned = re.sub(r';-?\)', '', cleaned)  # ;) or ;-)
+        cleaned = re.sub(r':-?\)', '', cleaned)  # :) or :-)
+        cleaned = re.sub(r':-?\(', '', cleaned)  # :( or :-(
+        cleaned = re.sub(r':-?[DdPpOo]', '', cleaned)  # :D, :P, :O, etc.
+        cleaned = re.sub(r'\[.*?\]', '', cleaned)  # [smirk], [smile], etc.
+        cleaned = re.sub(r'<.*?>', '', cleaned)   # <grin>, <wink>, etc.
+        
         # Remove action asterisks like *smiles*
-        cleaned = re.sub(r'\*[^*]*\*', '', response or '')
-        return ' '.join(cleaned.split()).strip()
+        cleaned = re.sub(r'\*[^*]*\*', '', cleaned)
+        
+        # Remove other visual markers
+        cleaned = re.sub(r'[>]{2,}', '', cleaned)  # Remove >> markers
+        cleaned = re.sub(r'[~]{2,}', '', cleaned)  # Remove ~~ markers
+        
+        # Remove common speech artifacts and unwanted prefixes
+        prefixes_to_remove = [
+            r'^,\s*',           # Remove leading comma
+            r'^comma\s*',       # Remove "comma" at start
+            r'^um\s*',          # Remove "um"
+            r'^uh\s*',          # Remove "uh"
+            r'^well\s*',        # Remove "well"
+            r'^so\s*',          # Remove "so" at start
+            r'^okay\s*',        # Remove "okay" at start (when inappropriate)
+        ]
+        
+        for prefix in prefixes_to_remove:
+            cleaned = re.sub(prefix, '', cleaned, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace and punctuation spacing
+        cleaned = re.sub(r'\s+([,.!?;:])', r'\1', cleaned)  # Fix spacing before punctuation
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()      # Normalize all whitespace
+        
+        # Ensure first letter is capitalized if it's a sentence
+        if cleaned and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+        
+        return cleaned
 
     def _build_system_prompt(self) -> str:
         """Combine base system prompt + running memory into a single top-level system string."""
+        base_prompt = self.base_system_prompt
+        
+        # Add instruction to avoid unwanted prefixes
+        speech_instruction = (
+            "\n\nIMPORTANT: Respond naturally and conversationally. "
+            "Do NOT start responses with words like 'comma', 'um', 'uh', 'well', or other speech artifacts. "
+            "Jump straight into your response content."
+        )
+        
         if self.running_summary:
             return (
-                f"{self.base_system_prompt}\n\n"
+                f"{base_prompt}{speech_instruction}\n\n"
                 f"--- Memory (summarized context) ---\n"
                 f"{self.running_summary}\n"
                 f"--- End Memory ---"
             )
-        return self.base_system_prompt
+        return f"{base_prompt}{speech_instruction}"
 
     def _maybe_handle_voice_command(self, text: str) -> bool:
         """Return True if a local command was handled (e.g., reset memory)."""
@@ -348,7 +478,7 @@ class UltraFastTranscriber:
     def get_claude_response(self, text):
         # Optional local command (e.g., "reset memory")
         if self._maybe_handle_voice_command(text):
-            return "Okay — I’ve cleared our memory."
+            return "Okay — I've cleared our memory."
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -365,18 +495,24 @@ class UltraFastTranscriber:
                     if isinstance(m, dict) and m.get("role") in ("user", "assistant")
                 ]
 
-                # Top-level system carries base prompt + running memory
+                # Top-level system carries base prompt + running memory + speech instructions
                 system_str = self._build_system_prompt()
 
                 response = self.claude_client.messages.create(
                     model="claude-3-5-sonnet-20241022",
                     max_tokens=200,
                     temperature=0.7,
-                    system=system_str,   # ✅ top-level system
+                    system=system_str,   # ✅ top-level system with speech instructions
                     messages=conv        # ✅ only 'user'|'assistant'
                 )
                 raw = response.content[0].text.strip()
                 cleaned = self.clean_response(raw)
+
+                # Double-check for comma prefix after cleaning
+                if cleaned.lower().startswith('comma'):
+                    cleaned = cleaned[5:].strip()  # Remove "comma" and any following space
+                    if cleaned and cleaned[0].islower():
+                        cleaned = cleaned[0].upper() + cleaned[1:]
 
                 # Save assistant reply and persist
                 self.history.append({"role": "assistant", "content": cleaned})
@@ -422,12 +558,14 @@ class UltraFastTranscriber:
         if not self.audio_buffer:
             return None, None
 
-        transcription = self.transcribe_audio_local(self.audio_buffer)
-        if transcription:
-            print(f"📝 You said: {transcription}")
+        raw_transcription = self.transcribe_audio_local(self.audio_buffer)
+        if raw_transcription:
+            print(f"📝 Raw transcription: {raw_transcription}")
+            print(f"📝 You said: {raw_transcription}")
             # parallel_process waits for TTS to complete before returning
-            response = self.parallel_process(transcription)
-            return transcription, response
+            response = self.parallel_process(raw_transcription)
+            print(f"🔍 Claude's raw response: {repr(response)}")
+            return raw_transcription, response
         return None, None
 
 def main():
