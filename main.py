@@ -15,6 +15,8 @@ import platform
 import shutil
 import json
 import re
+import wave
+import tempfile
 
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -71,13 +73,15 @@ class UltraFastTranscriber:
         self.memory_path = "conversation.json"
         self._load_memory()
         
-        # Optimized audio settings
+        # IMPROVED audio settings for better quality
         self.audio_format = pyaudio.paInt16
         self.channels = 1
-        self.rate = 16000
-        self.chunk = 8192
+        self.rate = 16000  # Standard rate for Whisper
+        self.chunk = 4096  # Smaller chunks for better responsiveness
         self.recording = False
-        self.audio_data = BytesIO()
+        self.min_recording_duration = 0.5  # Minimum 0.5 seconds
+        self.silence_threshold = 500  # RMS threshold for silence detection
+        self.silence_duration = 1.5  # Stop after 1.5s of silence
         
         # Threading executor
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
@@ -188,7 +192,7 @@ class UltraFastTranscriber:
         
         try:
             if platform.system() == 'Darwin':
-                subprocess.run(['say', '-v', 'Jamie (Premium)', '-r', '180', tts_text], check=True)
+                subprocess.run(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text], check=True)
             elif platform.system() == 'Linux':
                 subprocess.run(['espeak', '-s', '160', '-p', '40', tts_text], check=True)
             return True
@@ -217,7 +221,15 @@ class UltraFastTranscriber:
             print(f"❌ Error reading prompt file: {e}")
             return "You are a helpful AI assistant. Keep responses concise and conversational."
 
-    # ---------- Audio + Spacebar interrupt ----------
+    # ---------- IMPROVED Audio processing ----------
+    def calculate_rms(self, data):
+        """Calculate RMS (root mean square) for volume detection."""
+        try:
+            audio_np = np.frombuffer(data, dtype=np.int16)
+            return np.sqrt(np.mean(audio_np ** 2))
+        except:
+            return 0
+
     def _detect_raw_mode_support(self):
         if platform.system() == "Windows":
             return True  # we'll use msvcrt
@@ -249,25 +261,34 @@ class UltraFastTranscriber:
                 pass
 
     def record_audio_optimized(self):
+        """Enhanced recording with better silence detection and quality."""
         audio = pyaudio.PyAudio()
-        stream = audio.open(
-            format=self.audio_format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk
-        )
+        
+        try:
+            stream = audio.open(
+                format=self.audio_format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                frames_per_buffer=self.chunk
+            )
+        except Exception as e:
+            print(f"❌ Could not open audio stream: {e}")
+            return None
 
         # UX hint
         if self._raw_mode_is_windows():
-            print("🎤 Recording... Press SPACE (or Enter) to stop.")
+            print("🎤 Recording... Press SPACE (or Enter) to stop, or speak and pause.")
         elif self._raw_supported:
-            print("🎤 Recording... Press SPACE (or Enter) to stop.")
+            print("🎤 Recording... Press SPACE (or Enter) to stop, or speak and pause.")
         else:
             print("🎤 Recording... Press Enter to stop (raw keys unavailable).")
 
         self.recording = True
         audio_frames = []
+        start_time = time.time()
+        last_sound_time = time.time()
+        has_sound = False
 
         # Start a raw key listener where possible
         stop_flag = threading.Event()
@@ -291,6 +312,9 @@ class UltraFastTranscriber:
 
         try:
             while self.recording:
+                current_time = time.time()
+                
+                # Handle keyboard input for Windows
                 if self._raw_mode_is_windows():
                     import msvcrt
                     if msvcrt.kbhit():
@@ -305,12 +329,43 @@ class UltraFastTranscriber:
                 try:
                     data = stream.read(self.chunk, exception_on_overflow=False)
                     audio_frames.append(data)
-                except Exception:
+                    
+                    # Calculate volume for silence detection
+                    rms = self.calculate_rms(data)
+                    
+                    if rms > self.silence_threshold:
+                        has_sound = True
+                        last_sound_time = current_time
+                        
+                    # Auto-stop conditions
+                    recording_duration = current_time - start_time
+                    silence_duration = current_time - last_sound_time
+                    
+                    # Stop if we've been silent for too long after detecting sound
+                    if has_sound and silence_duration > self.silence_duration and recording_duration > self.min_recording_duration:
+                        print("🔇 Auto-stopping due to silence...")
+                        self.stop_recording()
+                        break
+                    
+                    # Maximum recording time safety net
+                    if recording_duration > 30:  # 30 second max
+                        print("⏰ Max recording time reached...")
+                        self.stop_recording()
+                        break
+                        
+                except Exception as e:
+                    print(f"⚠️ Audio read error: {e}")
                     continue
         finally:
-            stream.stop_stream()
-            stream.close()
-            audio.terminate()
+            try:
+                stream.stop_stream()
+                stream.close()
+            except:
+                pass
+            try:
+                audio.terminate()
+            except:
+                pass
             # ensure key thread cleaned up
             stop_flag.set()
             if key_thread and key_thread.is_alive():
@@ -319,7 +374,15 @@ class UltraFastTranscriber:
                 except Exception:
                     pass
 
-        return b''.join(audio_frames)
+        if not audio_frames:
+            print("❌ No audio captured")
+            return None
+            
+        audio_data = b''.join(audio_frames)
+        duration = len(audio_data) / (self.rate * 2)  # 2 bytes per sample for int16
+        print(f"📊 Captured {duration:.1f}s of audio")
+        
+        return audio_data
 
     def _raw_mode_is_windows(self):
         return platform.system() == "Windows"
@@ -327,42 +390,116 @@ class UltraFastTranscriber:
     def stop_recording(self):
         self.recording = False
     
-    def transcribe_audio_local(self, audio_data):
+    def save_audio_debug(self, audio_data, filename="debug_audio.wav"):
+        """Save audio data to WAV file for debugging."""
         try:
+            with wave.open(filename, 'wb') as wav_file:
+                wav_file.setnchannels(self.channels)
+                wav_file.setsampwidth(2)  # 2 bytes for int16
+                wav_file.setframerate(self.rate)
+                wav_file.writeframes(audio_data)
+            print(f"🔍 Debug audio saved to {filename}")
+        except Exception as e:
+            print(f"❌ Could not save debug audio: {e}")
+
+    def transcribe_audio_local(self, audio_data):
+        """Improved transcription with better preprocessing."""
+        try:
+            if not audio_data or len(audio_data) < 1000:  # Less than ~0.03 seconds
+                print("❌ Audio too short for transcription")
+                return None
+            
+            # Convert to float32 numpy array
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Add initial prompt to discourage transcribing punctuation as words
-            initial_prompt = "Hello, how are you today? I'm doing well, thanks for asking."
+            # Check if audio has any meaningful content
+            rms = np.sqrt(np.mean(audio_np ** 2))
+            if rms < 0.01:  # Very quiet audio
+                print("❌ Audio too quiet for transcription")
+                return None
             
+            print(f"🔍 Audio RMS: {rms:.4f}, Length: {len(audio_np)/16000:.2f}s")
+            
+            # For debugging: save the audio file
+            # self.save_audio_debug(audio_data)
+            
+            # Enhanced transcription parameters
             segments, info = self.whisper_model.transcribe(
                 audio_np,
                 language="en",
-                beam_size=1,
-                best_of=1,
+                beam_size=5,  # Better beam search
+                best_of=5,    # Try multiple candidates
                 temperature=0.0,
-                initial_prompt=initial_prompt
+                word_timestamps=True,  # Enable word-level timestamps
+                vad_filter=True,      # Voice activity detection
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    max_speech_duration_s=30
+                ),
+                initial_prompt="Hello, how are you today? I'm doing well, thanks for asking. "
+                             "This is a natural conversation with clear speech."
             )
-            text = " ".join([segment.text.strip() for segment in segments])
             
-            # Clean up common transcription artifacts
+            # Collect segments with confidence filtering
+            text_segments = []
+            for segment in segments:
+                # Skip very short segments (likely noise)
+                if segment.end - segment.start < 0.3:
+                    continue
+                    
+                # Skip segments with very low confidence (if available)
+                segment_text = segment.text.strip()
+                if segment_text and len(segment_text) > 1:
+                    text_segments.append(segment_text)
+            
+            if not text_segments:
+                print("❌ No meaningful speech detected")
+                return None
+                
+            text = " ".join(text_segments)
+            
+            # Enhanced cleaning
             text = self.clean_transcription(text)
             
-            return text
+            print(f"🎯 Transcription confidence: {info.language_probability:.2f}")
+            
+            return text if text.strip() else None
+            
         except Exception as e:
             print(f"❌ Local transcription error: {e}")
             return None
 
     def clean_transcription(self, text: str) -> str:
-        """Clean transcription artifacts like spoken punctuation."""
+        """Enhanced transcription cleaning."""
         if not text:
             return ""
         
         cleaned = text.strip()
         
-        # Remove common transcription artifacts where punctuation is transcribed as words
+        # Remove common Whisper hallucinations
+        hallucinations = [
+            r'\bthanks for watching\b',
+            r'\bsubscribe\b',
+            r'\blike and subscribe\b',
+            r'\bwww\.',
+            r'\bmusic\]',
+            r'\[music\]',
+            r'\[applause\]',
+            r'\[laughter\]',
+            r'\[inaudible\]',
+            r'\[silence\]',
+            r'^\s*\.',  # Leading period
+            r'^\s*,',   # Leading comma
+        ]
+        
+        for pattern in hallucinations:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        
+        # Remove punctuation words transcribed incorrectly
         punctuation_words = [
             (r'\bcomma\b', ','),
             (r'\bperiod\b', '.'),  
+            (r'\bfull stop\b', '.'),
             (r'\bquestion mark\b', '?'),
             (r'\bexclamation mark\b', '!'),
             (r'\bexclamation point\b', '!'),
@@ -385,9 +522,27 @@ class UltraFastTranscriber:
         # Remove standalone punctuation words at the beginning
         cleaned = re.sub(r'^(comma|period|question mark|exclamation|colon|semicolon)\s+', '', cleaned, flags=re.IGNORECASE)
         
+        # Remove repeated words (common Whisper issue)
+        words = cleaned.split()
+        filtered_words = []
+        for i, word in enumerate(words):
+            # Don't add if it's the same as the previous word (unless it's a short word that can legitimately repeat)
+            if i == 0 or word.lower() != words[i-1].lower() or len(word) <= 2:
+                filtered_words.append(word)
+        
+        cleaned = ' '.join(filtered_words)
+        
         # Clean up extra spaces around punctuation
         cleaned = re.sub(r'\s+([,.!?;:])', r'\1', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        # Ensure first letter is capitalized if it's a sentence
+        if cleaned and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+        
+        # Remove if it's too short or just punctuation
+        if len(cleaned.replace(' ', '').replace('.', '').replace(',', '').replace('!', '').replace('?', '')) < 2:
+            return ""
         
         return cleaned
 
@@ -560,13 +715,13 @@ class UltraFastTranscriber:
 
         raw_transcription = self.transcribe_audio_local(self.audio_buffer)
         if raw_transcription:
-            print(f"📝 Raw transcription: {raw_transcription}")
             print(f"📝 You said: {raw_transcription}")
             # parallel_process waits for TTS to complete before returning
             response = self.parallel_process(raw_transcription)
-            print(f"🔍 Claude's raw response: {repr(response)}")
             return raw_transcription, response
-        return None, None
+        else:
+            print("❌ Could not transcribe audio - please try again")
+            return None, None
 
 def main():
     print("⚡ ULTRA-FAST Voice Character System")
@@ -587,7 +742,7 @@ def main():
         elif platform.system() not in ['Darwin', 'Linux']:
             print("   • Use macOS or Linux for system TTS")
 
-    print("\n🎯 Ready! Speak — press SPACE (or Enter) to stop.")
+    print("\n🎯 Ready! Speak — press SPACE (or Enter) to stop, or just pause after speaking.")
     try:
         while True:
             try:
