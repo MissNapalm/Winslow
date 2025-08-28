@@ -25,14 +25,16 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 load_dotenv()
 
 # ---------- Typewriter printer (yellow) ----------
-def typewriter_print(text, delay=0.01, color="\033[93m"):
-    """Print text with a typewriter effect in yellow by default (ANSI)."""
+def typewriter_print(text, delay=0.02, color="\033[93m", stop_event=None):
+    """Print text with a typewriter effect in yellow by default (ANSI). Supports interruption via stop_event."""
     try:
         sys.stdout.write(color)
         sys.stdout.flush()
     except Exception:
         pass
     for ch in text:
+        if stop_event and stop_event.is_set():
+            break
         sys.stdout.write(ch)
         sys.stdout.flush()
         time.sleep(delay)
@@ -88,6 +90,9 @@ class UltraFastTranscriber:
 
         # Keyboard raw mode support (for spacebar)
         self._raw_supported = self._detect_raw_mode_support()
+
+        # Answer interruption support
+        self.answer_interrupt_event = threading.Event()
 
     # ---------- Memory management ----------
     def _cleanup_memory(self):
@@ -226,10 +231,17 @@ class UltraFastTranscriber:
         tts_text = self.clean_text_for_tts(text)
         
         try:
+            proc = None
             if platform.system() == 'Darwin':
-                subprocess.run(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text], check=True)
+                proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
             elif platform.system() == 'Linux':
-                subprocess.run(['espeak', '-s', '160', '-p', '40', tts_text], check=True)
+                proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
+            if proc:
+                while proc.poll() is None:
+                    if self.answer_interrupt_event.is_set():
+                        proc.terminate()
+                        break
+                    time.sleep(0.05)
             return True
         except Exception as e:
             print(f"❌ System TTS error: {e}")
@@ -237,7 +249,7 @@ class UltraFastTranscriber:
             return False
 
     def speak_async(self, text):
-        """Start OS TTS in the background so it overlaps with the typewriter."""
+        """Start OS TTS in the background so it overlaps with the typewriter. Respects interruption."""
         t = threading.Thread(target=self.speak_system, args=(text,), daemon=True)
         t.start()
         return t
@@ -728,28 +740,69 @@ class UltraFastTranscriber:
         return "Sorry, I'm having trouble connecting right now. Can you try again?"
 
     def parallel_process(self, transcription):
-        """Get reply, start TTS + typewriter together, and WAIT until TTS finishes before returning."""
+        """Get reply, start TTS + typewriter together, and WAIT until TTS finishes before returning. Spacebar cuts off answer and returns to listening."""
         try:
+            self.answer_interrupt_event.clear()
             reply = self.executor.submit(self.get_claude_response, transcription).result(timeout=45)
             if reply:
-                # Start TTS immediately (non-blocking) so it overlaps with typewriter
                 tts_thread = self.speak_async(reply)
-                # Yellow typewriter prints in parallel with TTS
-                typewriter_print(f"🤖 Character: {reply}")
-                # 🔒 IMPORTANT: wait for TTS to finish before starting next cycle
+                # Start a watcher for spacebar to interrupt
+                stop_event = self.answer_interrupt_event
+                watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
+                watcher.start()
+                typewriter_print(f"🤖 Character: {reply}", delay=0.02, stop_event=stop_event)
+                stop_event.set()  # Ensure TTS stops if typewriter is interrupted
                 if tts_thread is not None:
                     tts_thread.join()
+                watcher.join(timeout=0.1)
+                if stop_event.is_set():
+                    print("⏹️  Interrupted by spacebar. Listening again...")
             return reply
         except concurrent.futures.TimeoutError:
             fallback = "Sorry, I'm taking too long to think. Can you try again?"
             tts_thread = self.speak_async(fallback)
-            typewriter_print(f"🤖 Character: {fallback}")
+            stop_event = self.answer_interrupt_event
+            watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
+            watcher.start()
+            typewriter_print(f"🤖 Character: {fallback}", delay=0.02, stop_event=stop_event)
+            stop_event.set()
             if tts_thread is not None:
                 tts_thread.join()
+            watcher.join(timeout=0.1)
             return fallback
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
             return None
+
+    def _watch_spacebar_interrupt(self, stop_event):
+        """Watch for spacebar to interrupt answer (typewriter/TTS)."""
+        try:
+            if platform.system() == "Windows":
+                import msvcrt
+                while not stop_event.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b' ',):
+                            stop_event.set()
+                            break
+                    time.sleep(0.05)
+            else:
+                import sys, select, termios, tty
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    while not stop_event.is_set():
+                        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                            ch = sys.stdin.read(1)
+                            if ch == ' ':
+                                stop_event.set()
+                                break
+                        time.sleep(0.05)
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
     # ---------- Workflow ----------
     def ultra_fast_workflow(self):
