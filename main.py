@@ -90,6 +90,22 @@ class UltraFastTranscriber:
         self._raw_supported = self._detect_raw_mode_support()
 
     # ---------- Memory management ----------
+    def _cleanup_memory(self):
+        """Remove any empty or invalid messages from history."""
+        original_count = len(self.history)
+        self.history = [
+            m for m in self.history 
+            if (isinstance(m, dict) and 
+                m.get("role") in ("user", "assistant") and 
+                m.get("content") and 
+                str(m.get("content")).strip())
+        ]
+        cleaned_count = len(self.history)
+        
+        if original_count != cleaned_count:
+            print(f"🧹 Cleaned {original_count - cleaned_count} empty messages from memory")
+            self._save_memory()
+
     def _load_memory(self):
         try:
             if os.path.exists(self.memory_path):
@@ -97,9 +113,13 @@ class UltraFastTranscriber:
                     data = json.load(f)
                 self.history = data.get("history", [])
                 self.running_summary = data.get("running_summary", "")
+                # Clean up any empty messages from loaded data
+                self._cleanup_memory()
                 print("🧠 Loaded conversation memory.")
         except Exception as e:
             print(f"⚠️ Could not load memory: {e}")
+            self.history = []
+            self.running_summary = ""
 
     def _save_memory(self):
         try:
@@ -114,6 +134,15 @@ class UltraFastTranscriber:
     def _maybe_summarize_history(self):
         """When history gets big, summarize the oldest half into running_summary."""
         try:
+            # Filter out any empty messages before checking size
+            self.history = [
+                m for m in self.history 
+                if (isinstance(m, dict) and 
+                    m.get("role") in ("user", "assistant") and 
+                    m.get("content") and 
+                    str(m.get("content")).strip())
+            ]
+            
             serialized = json.dumps(self.history, ensure_ascii=False)
             if len(serialized) <= self.max_history_chars or len(self.history) < 6:
                 return
@@ -135,8 +164,14 @@ class UltraFastTranscriber:
                 messages=[{"role": "user", "content": prompt}]
             )
             summary = resp.content[0].text.strip()
-            self.running_summary += (("\n" if self.running_summary else "") + summary)
-            print("🧠 Summarized older history.")
+            
+            # Only add summary if it's non-empty
+            if summary:
+                self.running_summary += (("\n" if self.running_summary else "") + summary)
+                print("🧠 Summarized older history.")
+            else:
+                print("⚠️ Summary was empty, skipping...")
+                
         except Exception as e:
             print(f"⚠️ Could not summarize: {e}")
 
@@ -348,7 +383,7 @@ class UltraFastTranscriber:
                         break
                     
                     # Maximum recording time safety net
-                    if recording_duration > 30:  # 30 second max
+                    if recording_duration > 500:  # 500 second max
                         print("⏰ Max recording time reached...")
                         self.stop_recording()
                         break
@@ -644,11 +679,21 @@ class UltraFastTranscriber:
                 self.history.append({"role": "user", "content": text})
                 self._maybe_summarize_history()
 
-                # Build messages: ONLY user/assistant roles
-                conv = [
-                    m for m in self.history[-20:]
-                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-                ]
+                # Build messages: ONLY user/assistant roles with non-empty content
+                conv = []
+                for m in self.history[-20:]:
+                    if (isinstance(m, dict) and 
+                        m.get("role") in ("user", "assistant") and 
+                        m.get("content") and 
+                        str(m.get("content")).strip()):  # Ensure content is not empty/whitespace
+                        conv.append({
+                            "role": m["role"],
+                            "content": str(m["content"]).strip()
+                        })
+
+                # Ensure we have at least one message
+                if not conv:
+                    conv = [{"role": "user", "content": text}]
 
                 # Top-level system carries base prompt + running memory + speech instructions
                 system_str = self._build_system_prompt()
@@ -658,7 +703,7 @@ class UltraFastTranscriber:
                     max_tokens=200,
                     temperature=0.7,
                     system=system_str,   # ✅ top-level system with speech instructions
-                    messages=conv        # ✅ only 'user'|'assistant'
+                    messages=conv        # ✅ only 'user'|'assistant' with non-empty content
                 )
                 raw = response.content[0].text.strip()
                 cleaned = self.clean_response(raw)
@@ -669,9 +714,10 @@ class UltraFastTranscriber:
                     if cleaned and cleaned[0].islower():
                         cleaned = cleaned[0].upper() + cleaned[1:]
 
-                # Save assistant reply and persist
-                self.history.append({"role": "assistant", "content": cleaned})
-                self._save_memory()
+                # Save assistant reply and persist (only if non-empty)
+                if cleaned.strip():
+                    self.history.append({"role": "assistant", "content": cleaned})
+                    self._save_memory()
 
                 return cleaned
             except Exception as e:
