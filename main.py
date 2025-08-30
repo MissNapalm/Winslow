@@ -18,6 +18,12 @@ import re
 import wave
 import tempfile
 
+# NEW imports for folder image analysis
+from pathlib import Path
+from PIL import Image
+import base64
+import mimetypes
+
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -74,6 +80,11 @@ class UltraFastTranscriber:
         self.max_history_chars = 14000
         self.memory_path = "conversation.json"
         self._load_memory()
+
+        # NEW: images folder (for vision commands)
+        self.images_dir = Path(os.getenv("IMAGES_DIR", "images")).resolve()
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        print(f"🖼️  Images directory: {self.images_dir}")
         
         # IMPROVED audio settings for better quality
         self.audio_format = pyaudio.paInt16
@@ -203,22 +214,15 @@ class UltraFastTranscriber:
         if not text:
             return ""
         
-        # Remove common emoticons and visual elements that TTS mangles
+        # Remove common emoticons and visual elements
         tts_text = text
-        
-        # Remove bracketed emoticons like >:], :], [smirk], etc.
         tts_text = re.sub(r'>:\]', '', tts_text)
         tts_text = re.sub(r':\]', '', tts_text) 
         tts_text = re.sub(r'\[.*?\]', '', tts_text)
         tts_text = re.sub(r'<.*?>', '', tts_text)
-        
-        # Remove other common visual markers
-        tts_text = re.sub(r'[>]{2,}', '', tts_text)  # Remove >> markers
-        tts_text = re.sub(r'[*]{1,2}[^*]*[*]{1,2}', '', tts_text)  # Remove *action* markers
-        
-        # Clean up extra whitespace
+        tts_text = re.sub(r'[>]{2,}', '', tts_text)  # >>
+        tts_text = re.sub(r'[*]{1,2}[^*]*[*]{1,2}', '', tts_text)  # *action*
         tts_text = ' '.join(tts_text.split()).strip()
-        
         return tts_text
 
     def speak_system(self, text):
@@ -602,7 +606,6 @@ class UltraFastTranscriber:
         cleaned = response.strip()
         
         # Remove ALL emoticons and visual elements
-        # Remove bracketed emoticons like >:], :], [smirk], etc.
         cleaned = re.sub(r'>:\]', '', cleaned)
         cleaned = re.sub(r':\]', '', cleaned)
         cleaned = re.sub(r':\)', '', cleaned)
@@ -665,22 +668,123 @@ class UltraFastTranscriber:
             )
         return f"{base_prompt}{speech_instruction}"
 
-    def _maybe_handle_voice_command(self, text: str) -> bool:
-        """Return True if a local command was handled (e.g., reset memory)."""
+    # ---------- NEW: Folder Image Recognition ----------
+    def _prepare_image_for_api(self, image_path: Path):
+        """
+        Convert image to RGB JPEG (quality 85), base64-encode.
+        Returns (media_type, base64_str).
+        """
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=85, optimize=True)
+            data = buf.getvalue()
+        b64 = base64.b64encode(data).decode("utf-8")
+        return "image/jpeg", b64
+
+    def _list_images(self):
+        pats = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif", "*.webp"]
+        files = []
+        for pat in pats:
+            files.extend(self.images_dir.glob(pat))
+        files = [f for f in files if f.is_file()]
+        return sorted(files, key=lambda p: p.stat().st_mtime)
+
+    def analyze_image_with_claude(self, user_text: str, image_path: Path) -> str:
+        """
+        Send the image + prompt to Claude (vision) and return the response.
+        """
+        try:
+            media_type, b64 = self._prepare_image_for_api(image_path)
+
+            # Build short recent context
+            conv = []
+            for m in self.history[-10:]:
+                if (isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                    and m.get("content") and str(m.get("content")).strip()):
+                    conv.append({"role": m["role"], "content": [{"type":"text","text": str(m["content"]).strip()}]})
+
+            # Append this image turn
+            content_blocks = [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": b64}
+                },
+                {"type": "text", "text": user_text or "Describe this image in detail."}
+            ]
+            conv.append({"role": "user", "content": content_blocks})
+
+            response = self.claude_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=600,
+                temperature=0.2,
+                system=self._build_system_prompt(),
+                messages=conv
+            )
+            raw = response.content[0].text.strip()
+            cleaned = self.clean_response(raw)
+
+            # Save to memory
+            self.history.append({"role": "user", "content": f"[image:{image_path.name}] {user_text or 'Describe this image.'}"})
+            if cleaned:
+                self.history.append({"role": "assistant", "content": cleaned})
+                self._save_memory()
+
+            return cleaned or "I couldn’t describe that image."
+        except Exception as e:
+            print(f"❌ Vision error: {e}")
+            return "Sorry, I couldn’t analyze that image."
+
+    def analyze_latest_image(self, prompt: str = "Describe this image in detail.") -> str:
+        imgs = self._list_images()
+        if not imgs:
+            return "I can’t find any images in the images folder."
+        latest = imgs[-1]
+        print(f"🕵️ Analyzing latest image: {latest.name}")
+        return self.analyze_image_with_claude(prompt, latest)
+
+    # ---------- UPDATED: Voice commands ----------
+    def _maybe_handle_voice_command(self, text: str):
+        """
+        Handle local commands:
+          - 'reset memory' / 'clear memory' / 'forget everything' / 'wipe memory'
+          - 'analyze the image'  -> analyze latest image
+          - 'analyze image <filename>' -> analyze specific file in images folder
+        Returns a string response if handled, or False/None if not.
+        """
         if not text:
             return False
         t = text.strip().lower()
+
+        # Memory reset
         if any(cmd in t for cmd in ["reset memory", "clear memory", "forget everything", "wipe memory"]):
             self._reset_memory()
             print("🗑️  Memory cleared by voice command.")
-            return True
+            return "Okay — I've cleared our memory."
+
+        # Analyze image commands
+        if re.search(r'\banalyze (the )?image\b', t):
+            # Specific filename?
+            m = re.search(r'\banalyze image\s+([^\s].+)$', t)
+            if m:
+                name = m.group(1).strip().strip('"').strip("'")
+                path = (self.images_dir / name)
+                if not path.exists():
+                    return f"I couldn’t find {name} in the images folder."
+                return self.analyze_image_with_claude("Describe this image in detail.", path)
+            # Otherwise, latest
+            return self.analyze_latest_image("Describe this image in detail.")
+
         return False
 
     # ---------- Claude ----------
     def get_claude_response(self, text):
-        # Optional local command (e.g., "reset memory")
-        if self._maybe_handle_voice_command(text):
-            return "Okay — I've cleared our memory."
+        # Check for local commands first (now includes image analysis)
+        local = self._maybe_handle_voice_command(text)
+        if local:
+            return local
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -697,7 +801,7 @@ class UltraFastTranscriber:
                     if (isinstance(m, dict) and 
                         m.get("role") in ("user", "assistant") and 
                         m.get("content") and 
-                        str(m.get("content")).strip()):  # Ensure content is not empty/whitespace
+                        str(m.get("content")).strip()):
                         conv.append({
                             "role": m["role"],
                             "content": str(m["content"]).strip()
@@ -842,6 +946,7 @@ def main():
             print("   • Use macOS or Linux for system TTS")
 
     print("\n🎯 Ready! Speak — press SPACE (or Enter) to stop, or just pause after speaking.")
+    print("   Try: “analyze the image” or “analyze image myphoto.jpg” (from ./images)")
     try:
         while True:
             try:
