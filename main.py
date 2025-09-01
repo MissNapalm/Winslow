@@ -104,6 +104,9 @@ class UltraFastTranscriber:
 
         # Answer interruption support
         self.answer_interrupt_event = threading.Event()
+        
+        # Flag to track explicit spacebar presses
+        self.spacebar_pressed = False
 
     # ---------- Memory management ----------
     def _cleanup_memory(self):
@@ -234,58 +237,53 @@ class UltraFastTranscriber:
         # Clean text for TTS while keeping original for display
         tts_text = self.clean_text_for_tts(text)
         
-        # For longer responses on macOS, we need to break them into smaller chunks
-        # The macOS 'say' command has limitations with very long text
+        # Use a simple approach with explicit interrupt checks
         try:
-            proc = None
-            if platform.system() == 'Darwin':
-                # If text is too long, split it by sentences to avoid TTS cutting off
-                if len(tts_text) > 1000:
-                    # Split by sentence endings but preserve them in the result
-                    sentences = re.split(r'(?<=[.!?])\s+', tts_text)
-                    for sentence in sentences:
-                        if not sentence.strip():
-                            continue
-                        if self.answer_interrupt_event.is_set():
-                            break
+            # Split text into sentences
+            sentences = re.split(r'(?<=[.!?])\s+', tts_text)
+            print(f"🔊 Speaking {len(tts_text)} characters as {len(sentences)} sentences")
+            
+            # Process each sentence
+            for i, sentence in enumerate(sentences):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                
+                # Check for interrupt - just check the event flag directly
+                if self.answer_interrupt_event.is_set() or self.spacebar_pressed:
+                    print("🔊 TTS interrupted by spacebar")
+                    break
+                
+                # Debugging info for longer responses
+                if i % 5 == 0 and len(sentences) > 8:
+                    print(f"🔊 Speaking {i+1}/{len(sentences)}...")
+                
+                # Speak the sentence with a buffer for smoother transitions
+                buffer_size = min(len(sentence), 30)  # Buffer to prevent cutting off
+                buffer = sentence[:buffer_size] if buffer_size > 0 else sentence
+                
+                try:
+                    proc = None
+                    if platform.system() == 'Darwin':
                         proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', sentence])
-                        # Wait for each sentence to complete before continuing
-                        while proc.poll() is None:
-                            if self.answer_interrupt_event.is_set():
-                                proc.terminate()
-                                break
-                            time.sleep(0.05)
-                else:
-                    # For shorter text, use original approach
-                    proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
-                    while proc.poll() is None:
-                        if self.answer_interrupt_event.is_set():
-                            proc.terminate()
-                            break
-                        time.sleep(0.05)
-            elif platform.system() == 'Linux':
-                # For Linux with espeak, we also split long text
-                if len(tts_text) > 1000:
-                    sentences = re.split(r'(?<=[.!?])\s+', tts_text)
-                    for sentence in sentences:
-                        if not sentence.strip():
-                            continue
-                        if self.answer_interrupt_event.is_set():
-                            break
+                    elif platform.system() == 'Linux':
                         proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', sentence])
-                        while proc.poll() is None:
-                            if self.answer_interrupt_event.is_set():
-                                proc.terminate()
-                                break
-                            time.sleep(0.05)
-                else:
-                    proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
-                    while proc.poll() is None:
-                        if self.answer_interrupt_event.is_set():
-                            proc.terminate()
-                            break
-                        time.sleep(0.05)
+                        
+                    # Wait for completion with explicit interrupt check
+                    if proc:
+                        ret = proc.wait()
+                except Exception as err:
+                    print(f"⚠️ TTS error (non-critical): {err}")
+                
+                # Don't add a pause after the last sentence
+                if i < len(sentences) - 1:
+                    time.sleep(0.1)  # Small pause between sentences
+            
+            # Only show completion message if not interrupted
+            if not (hasattr(self, 'spacebar_pressed') and self.spacebar_pressed):
+                print("🔊 TTS complete")
             return True
+            
         except Exception as e:
             print(f"❌ System TTS error: {e}")
             print(f"🔊 Character would say: {tts_text}")
@@ -293,6 +291,11 @@ class UltraFastTranscriber:
 
     def speak_async(self, text):
         """Start OS TTS in the background so it overlaps with the typewriter. Respects interruption."""
+        # Reset spacebar flag
+        self.spacebar_pressed = False
+        self.answer_interrupt_event.clear()
+        
+        # Start speech in background thread
         t = threading.Thread(target=self.speak_system, args=(text,), daemon=True)
         t.start()
         return t
@@ -885,34 +888,78 @@ class UltraFastTranscriber:
     def parallel_process(self, transcription):
         """Get reply, start TTS + typewriter together, and WAIT until TTS finishes before returning. Spacebar cuts off answer and returns to listening."""
         try:
+            # Clear flags before starting
+            self.spacebar_pressed = False
             self.answer_interrupt_event.clear()
+            
+            # Get Claude's response
             reply = self.executor.submit(self.get_claude_response, transcription).result(timeout=45)
             if reply:
-                tts_thread = self.speak_async(reply)
-                # Start a watcher for spacebar to interrupt
+                # Setup interrupt detection
                 stop_event = self.answer_interrupt_event
+                
+                # Start the spacebar watcher FIRST
                 watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
                 watcher.start()
+                time.sleep(0.1)  # Small delay to ensure watcher is ready
+                
+                # Start TTS in background
+                tts_thread = self.speak_async(reply)
+                
+                # Print with typewriter effect in main thread
                 typewriter_print(f"🤖 Character: {reply}", delay=0.02, stop_event=stop_event)
-                stop_event.set()  # Ensure TTS stops if typewriter is interrupted
-                if tts_thread is not None:
+                
+                # After typewriter finishes, wait for speech to complete (unless interrupted)
+                if not self.spacebar_pressed and tts_thread is not None:
+                    print("⏺️  Waiting for speech to complete...")
                     tts_thread.join()
-                watcher.join(timeout=0.1)
-                if stop_event.is_set():
+                
+                # If spacebar was pressed during speech or typewriter
+                if self.spacebar_pressed:
                     print("⏹️  Interrupted by spacebar. Listening again...")
+                    # Ensure the event is set to stop any remaining speech
+                    stop_event.set()
+                
+                # Clean up threads
+                try:
+                    if watcher.is_alive():
+                        watcher.join(timeout=0.1)
+                except Exception:
+                    pass
+                    
             return reply
+            
         except concurrent.futures.TimeoutError:
+            self.spacebar_pressed = False
             fallback = "Sorry, I'm taking too long to think. Can you try again?"
-            tts_thread = self.speak_async(fallback)
+            
+            # Start interrupt watcher
             stop_event = self.answer_interrupt_event
             watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
             watcher.start()
+            
+            # Start TTS
+            tts_thread = self.speak_async(fallback)
+            
+            # Show fallback message
             typewriter_print(f"🤖 Character: {fallback}", delay=0.02, stop_event=stop_event)
-            stop_event.set()
+            
+            # Only stop if spacebar was pressed
+            if self.spacebar_pressed:
+                stop_event.set()
+                
+            # Wait for TTS to finish
             if tts_thread is not None:
                 tts_thread.join()
-            watcher.join(timeout=0.1)
+                
+            # Clean up
+            try:
+                watcher.join(timeout=0.1)
+            except Exception:
+                pass
+                
             return fallback
+            
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
             return None
@@ -920,32 +967,54 @@ class UltraFastTranscriber:
     def _watch_spacebar_interrupt(self, stop_event):
         """Watch for spacebar to interrupt answer (typewriter/TTS)."""
         try:
+            # Reset the spacebar flag at the beginning
+            self.spacebar_pressed = False
+            
             if platform.system() == "Windows":
                 import msvcrt
                 while not stop_event.is_set():
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
                         if ch in (b' ',):
+                            self.spacebar_pressed = True
+                            print("🛑 Spacebar pressed - interrupting")
                             stop_event.set()
                             break
-                    time.sleep(0.05)
+                    time.sleep(0.01)  # Check more frequently
             else:
                 import sys, select, termios, tty
+                # Only proceed if stdin is a TTY
+                if not sys.stdin.isatty():
+                    print("⚠️ Not a TTY, spacebar interrupt unavailable")
+                    return
+                    
                 fd = sys.stdin.fileno()
-                old = termios.tcgetattr(fd)
                 try:
-                    tty.setcbreak(fd)
+                    # Save terminal settings
+                    old_settings = termios.tcgetattr(fd)
+                    # Set to raw mode
+                    tty.setraw(fd)  # Use raw mode for immediate character input
+                    
                     while not stop_event.is_set():
-                        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                        # Short timeout for responsive interrupt
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        if rlist:
                             ch = sys.stdin.read(1)
                             if ch == ' ':
+                                self.spacebar_pressed = True
+                                print("🛑 Spacebar pressed - interrupting")
                                 stop_event.set()
                                 break
-                        time.sleep(0.05)
+                            
                 finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except Exception:
-            pass
+                    # Always restore terminal settings
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    
+        except Exception as e:
+            print(f"⚠️ Keyboard watcher error: {e}")
+            # Even if there's an error, try to set the flags for interruption
+            self.spacebar_pressed = True
+            stop_event.set()
 
     # ---------- Workflow ----------
     def ultra_fast_workflow(self):
