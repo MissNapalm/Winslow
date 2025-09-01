@@ -234,18 +234,57 @@ class UltraFastTranscriber:
         # Clean text for TTS while keeping original for display
         tts_text = self.clean_text_for_tts(text)
         
+        # For longer responses on macOS, we need to break them into smaller chunks
+        # The macOS 'say' command has limitations with very long text
         try:
             proc = None
             if platform.system() == 'Darwin':
-                proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
+                # If text is too long, split it by sentences to avoid TTS cutting off
+                if len(tts_text) > 1000:
+                    # Split by sentence endings but preserve them in the result
+                    sentences = re.split(r'(?<=[.!?])\s+', tts_text)
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        if self.answer_interrupt_event.is_set():
+                            break
+                        proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', sentence])
+                        # Wait for each sentence to complete before continuing
+                        while proc.poll() is None:
+                            if self.answer_interrupt_event.is_set():
+                                proc.terminate()
+                                break
+                            time.sleep(0.05)
+                else:
+                    # For shorter text, use original approach
+                    proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
+                    while proc.poll() is None:
+                        if self.answer_interrupt_event.is_set():
+                            proc.terminate()
+                            break
+                        time.sleep(0.05)
             elif platform.system() == 'Linux':
-                proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
-            if proc:
-                while proc.poll() is None:
-                    if self.answer_interrupt_event.is_set():
-                        proc.terminate()
-                        break
-                    time.sleep(0.05)
+                # For Linux with espeak, we also split long text
+                if len(tts_text) > 1000:
+                    sentences = re.split(r'(?<=[.!?])\s+', tts_text)
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        if self.answer_interrupt_event.is_set():
+                            break
+                        proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', sentence])
+                        while proc.poll() is None:
+                            if self.answer_interrupt_event.is_set():
+                                proc.terminate()
+                                break
+                            time.sleep(0.05)
+                else:
+                    proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
+                    while proc.poll() is None:
+                        if self.answer_interrupt_event.is_set():
+                            proc.terminate()
+                            break
+                        time.sleep(0.05)
             return True
         except Exception as e:
             print(f"❌ System TTS error: {e}")
